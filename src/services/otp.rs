@@ -28,6 +28,79 @@ pub trait OtpProvider: Send + Sync {
 #[derive(Clone, Default)]
 pub struct MockOtpProvider {
     sent: Arc<Mutex<HashMap<String, String>>>,
+use chrono::{Duration, Utc};
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use sha2::Sha256;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::models::{Merchant, OtpChallenge, OtpChallengeResponse, User};
+use crate::otp::OtpProvider;
+use crate::services::users;
+
+/// How long a code is valid for.
+const CODE_TTL_SECS: i64 = 600;
+/// Minimum gap between two sends to the same phone for the same purpose —
+/// re-POSTing signup/login *is* the resend path, so this is what stops it
+/// from being spammed.
+const RESEND_COOLDOWN_SECS: i64 = 60;
+/// Spam cap: at most this many fresh challenges per phone+purpose per hour.
+/// A refreshed (cooldown-respecting) resend of an existing challenge doesn't
+/// count against this — only brand-new challenges do.
+const MAX_SENDS_PER_HOUR: i64 = 5;
+const MAX_ATTEMPTS: i32 = 5;
+
+/// OTP retention policy: audit records are kept for 24 hours after the
+/// challenge's `expires_at` timestamp. This gives enough time for
+/// debugging / support while preventing unbounded table growth.
+///
+/// At 5 challenges/hour per user across a large user base the table would
+/// otherwise grow to tens of thousands of stale rows, making the
+/// `WHERE consumed_at IS NULL AND expires_at > now()` queries progressively
+/// slower. The `otp_challenges_expires_at_idx` index (migration 0009) makes
+/// this DELETE efficient.
+///
+/// Call this periodically from a background task (e.g. every hour). It is
+/// safe to call concurrently; Postgres row-level locking prevents double
+/// deletes.
+pub async fn cleanup_expired(db: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM otp_challenges WHERE expires_at < now() - interval '24 hours'",
+    )
+    .execute(db)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OtpError {
+    #[error("too many requests, please try again shortly")]
+    RateLimited,
+    #[error("otp challenge not found or already used")]
+    ChallengeNotFound,
+    #[error("otp code has expired")]
+    Expired,
+    #[error("too many incorrect attempts")]
+    Locked,
+    #[error("incorrect code")]
+    InvalidCode,
+    #[error("email already registered")]
+    EmailTaken,
+    #[error("phone number already registered")]
+    PhoneTaken,
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("failed to send SMS: {0}")]
+    SendFailed(String),
+}
+
+pub enum VerifiedOutcome {
+    Login(User),
+    Signup(User, Merchant),
+    /// A `phone_change` challenge was verified; the user's phone number has
+    /// been switched to the newly verified one.
+    PhoneChanged(User),
 }
 
 impl MockOtpProvider {
@@ -45,6 +118,114 @@ impl MockOtpProvider {
             .expect("mock otp store poisoned")
             .get(destination)
             .cloned()
+    let (challenge_id, code) = upsert_challenge(
+        db,
+        hmac_secret,
+        NewChallenge {
+            purpose: "signup",
+            user_id: None,
+            pending_email: Some(email),
+            pending_password_hash: Some(password_hash),
+            pending_name: Some(name),
+            phone_number,
+        },
+    )
+    .await?;
+
+    send_code(otp, phone_number, &code).await?;
+    Ok(OtpChallengeResponse { challenge_id, expires_in_secs: CODE_TTL_SECS })
+}
+
+/// Sends a code to `new_phone` to prove the user controls it before
+/// `PATCH /me` switches their number (the same OTP flow as signup). The
+/// number isn't changed until the challenge is verified via `/verify-otp`.
+pub async fn start_phone_change_challenge(
+    db: &PgPool,
+    otp: &dyn OtpProvider,
+    hmac_secret: &str,
+    user_id: Uuid,
+    new_phone: &str,
+) -> Result<OtpChallengeResponse, OtpError> {
+    let phone_taken: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE phone_number = $1 AND id <> $2)")
+            .bind(new_phone)
+            .bind(user_id)
+            .fetch_one(db)
+            .await?;
+    if phone_taken {
+        return Err(OtpError::PhoneTaken);
+    }
+
+    let (challenge_id, code) = upsert_challenge(
+        db,
+        hmac_secret,
+        NewChallenge {
+            purpose: "phone_change",
+            user_id: Some(user_id),
+            pending_email: None,
+            pending_password_hash: None,
+            pending_name: None,
+            phone_number: new_phone,
+        },
+    )
+    .await?;
+
+    send_code(otp, new_phone, &code).await?;
+    Ok(OtpChallengeResponse { challenge_id, expires_in_secs: CODE_TTL_SECS })
+}
+
+pub async fn start_login_challenge(
+    db: &PgPool,
+    otp: &dyn OtpProvider,
+    hmac_secret: &str,
+    user: &User,
+) -> Result<OtpChallengeResponse, OtpError> {
+    let phone_number = user
+        .phone_number
+        .as_deref()
+        .expect("caller must only call this when the account has a phone on file");
+
+    let (challenge_id, code) = upsert_challenge(
+        db,
+        hmac_secret,
+        NewChallenge {
+            purpose: "login",
+            user_id: Some(user.id),
+            pending_email: None,
+            pending_password_hash: None,
+            pending_name: None,
+            phone_number,
+        },
+    )
+    .await?;
+
+    send_code(otp, phone_number, &code).await?;
+    Ok(OtpChallengeResponse { challenge_id, expires_in_secs: CODE_TTL_SECS })
+}
+
+pub async fn verify(
+    db: &PgPool,
+    hmac_secret: &str,
+    challenge_id: Uuid,
+    code: &str,
+) -> Result<VerifiedOutcome, OtpError> {
+    let challenge = sqlx::query_as::<_, OtpChallenge>(
+        "SELECT id, purpose, user_id, pending_email, pending_password_hash, pending_name,
+                phone_number, code_hash, attempts, max_attempts, expires_at, consumed_at,
+                last_sent_at, created_at
+           FROM otp_challenges WHERE id = $1",
+    )
+    .bind(challenge_id)
+    .fetch_optional(db)
+    .await?
+    .filter(|c| c.consumed_at.is_none())
+    .ok_or(OtpError::ChallengeNotFound)?;
+
+    if Utc::now() > challenge.expires_at {
+        return Err(OtpError::Expired);
+    }
+    if challenge.attempts >= challenge.max_attempts {
+        return Err(OtpError::Locked);
     }
 
     /// Return a snapshot of every code sent so far, keyed by destination.
@@ -73,6 +254,147 @@ impl OtpProvider for MockOtpProvider {
             .insert(destination.to_string(), code.to_string());
         tracing::info!(destination = %destination, "mock otp code captured");
         Ok(())
+    // Delete the challenge as soon as the code checks out: a signup row holds
+    // the pending password hash, which must not outlive its purpose. The
+    // DELETE is also the atomic claim — if a concurrent verify already took
+    // this challenge, nothing is deleted and this attempt fails.
+    let claimed = sqlx::query("DELETE FROM otp_challenges WHERE id = $1")
+        .bind(challenge_id)
+        .execute(db)
+        .await?
+        .rows_affected();
+    if claimed == 0 {
+        return Err(OtpError::ChallengeNotFound);
+    }
+
+    if challenge.purpose == "login" {
+        let user_id = challenge
+            .user_id
+            .expect("login challenge always carries user_id — enforced by the migration's CHECK constraint");
+        let user = users::user_by_id(db, user_id)
+            .await?
+            .ok_or(OtpError::ChallengeNotFound)?;
+        return Ok(VerifiedOutcome::Login(user));
+    }
+
+    if challenge.purpose == "phone_change" {
+        let user_id = challenge
+            .user_id
+            .expect("phone_change challenge always carries user_id — enforced by the migration's CHECK constraint");
+        let user = sqlx::query_as::<_, User>(
+            "UPDATE users SET phone_number = $2, phone_verified = true, updated_at = now()
+              WHERE id = $1
+              RETURNING id, email, password_hash, name, is_admin, phone_number, phone_verified, created_at, updated_at",
+        )
+        .bind(user_id)
+        .bind(&challenge.phone_number)
+        .fetch_optional(db)
+        .await
+        .map_err(|err| match users::unique_violation_field(&err) {
+            Some("users_phone_number_key") => OtpError::PhoneTaken,
+            _ => OtpError::Database(err),
+        })?
+        .ok_or(OtpError::ChallengeNotFound)?;
+        return Ok(VerifiedOutcome::PhoneChanged(user));
+    }
+
+    // purpose == "signup": this is the only place a signup ever actually
+    // creates the account — see the OTP plan for why gating just session
+    // issuance (and not account creation) would be a bypass.
+    let email = challenge
+        .pending_email
+        .as_deref()
+        .expect("signup challenge always carries pending_email — enforced by the migration's CHECK constraint");
+    let password_hash = challenge
+        .pending_password_hash
+        .as_deref()
+        .expect("signup challenge always carries pending_password_hash");
+    let name = challenge
+        .pending_name
+        .as_deref()
+        .expect("signup challenge always carries pending_name");
+
+    let (user, merchant) = users::create_verified(db, email, password_hash, name, &challenge.phone_number)
+        .await
+        .map_err(|err| match users::unique_violation_field(&err) {
+            Some("users_email_key") => OtpError::EmailTaken,
+            Some("users_phone_number_key") => OtpError::PhoneTaken,
+            _ => OtpError::Database(err),
+        })?;
+
+    Ok(VerifiedOutcome::Signup(user, merchant))
+}
+
+struct NewChallenge<'a> {
+    purpose: &'static str,
+    user_id: Option<Uuid>,
+    pending_email: Option<&'a str>,
+    pending_password_hash: Option<&'a str>,
+    pending_name: Option<&'a str>,
+    phone_number: &'a str,
+}
+
+/// Hard-deletes challenges that were consumed or expired more than 24 hours
+/// ago, so abandoned signups don't keep a pending password hash around.
+/// Rows younger than that are kept because the hourly send cap counts them.
+pub async fn purge_stale_challenges(db: &PgPool) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "DELETE FROM otp_challenges
+          WHERE (consumed_at IS NOT NULL OR expires_at < now())
+            AND created_at < now() - interval '24 hours'",
+    )
+    .execute(db)
+    .await?
+    .rows_affected())
+}
+
+/// Refreshes a still-live challenge for this phone+purpose in place if one
+/// exists (respecting the resend cooldown), otherwise inserts a fresh one
+/// (respecting the hourly spam cap). Returns the challenge id and the plain
+/// code — the only place the plain code exists outside an SMS.
+async fn upsert_challenge(
+    db: &PgPool,
+    hmac_secret: &str,
+    new: NewChallenge<'_>,
+) -> Result<(Uuid, String), OtpError> {
+    // There's no scheduler in this service, so stale rows are purged each
+    // time a challenge is issued. Best-effort: never block sending a code.
+    if let Err(err) = purge_stale_challenges(db).await {
+        tracing::warn!(error = %err, "failed to purge stale OTP challenges");
+    }
+
+    let existing: Option<(Uuid, chrono::DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, last_sent_at FROM otp_challenges
+          WHERE phone_number = $1 AND purpose = $2 AND consumed_at IS NULL AND expires_at > now()
+          ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(new.phone_number)
+    .bind(new.purpose)
+    .fetch_optional(db)
+    .await?;
+
+    if let Some((id, last_sent_at)) = existing {
+        if Utc::now() - last_sent_at < Duration::seconds(RESEND_COOLDOWN_SECS) {
+            return Err(OtpError::RateLimited);
+        }
+        let code = generate_code();
+        let code_hash = hash_code(hmac_secret, id, &code);
+        let expires_at = Utc::now() + Duration::seconds(CODE_TTL_SECS);
+        sqlx::query(
+            "UPDATE otp_challenges
+                SET code_hash = $2, attempts = 0, expires_at = $3, last_sent_at = now(),
+                    pending_email = $4, pending_password_hash = $5, pending_name = $6
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(&code_hash)
+        .bind(expires_at)
+        .bind(new.pending_email)
+        .bind(new.pending_password_hash)
+        .bind(new.pending_name)
+        .execute(db)
+        .await?;
+        return Ok((id, code));
     }
 }
 
