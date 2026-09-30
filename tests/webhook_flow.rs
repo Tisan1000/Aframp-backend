@@ -5,8 +5,8 @@ use serde_json::json;
 
 use common::{send, state};
 
-async fn app() -> Option<axum::Router> {
-    state().await.map(aframp::router)
+async fn app() -> axum::Router {
+    aframp::router(state().await)
 }
 
 #[tokio::test]
@@ -16,6 +16,7 @@ async fn termii_webhook_valid_signature_acknowledged() {
     let Some(app) = app().await else {
         return;
     };
+    let app = app().await;
     let (status, _) = send_with_signature(
         &app,
         "mock-signature",
@@ -37,6 +38,7 @@ async fn termii_webhook_wrong_signature_rejected() {
     let Some(app) = app().await else {
         return;
     };
+    let app = app().await;
     let (status, body) = send_with_signature(
         &app,
         "not-the-real-signature",
@@ -49,18 +51,14 @@ async fn termii_webhook_wrong_signature_rejected() {
 
 #[tokio::test]
 async fn termii_webhook_missing_signature_rejected() {
-    let Some(app) = app().await else {
-        return;
-    };
+    let app = app().await;
     let (status, _) = send(app.clone(), "POST", "/webhooks/termii", None, Some(json!({ "status": "Delivered" }))).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
 async fn termii_webhook_unrecognized_shape_still_acknowledged() {
-    let Some(app) = app().await else {
-        return;
-    };
+    let app = app().await;
     // Signature is valid but the payload doesn't look like anything we
     // expect — should still ack, never train the provider to retry forever.
     let (status, _) = send_with_signature(&app, "mock-signature", json!({ "totally": "unexpected" })).await;
