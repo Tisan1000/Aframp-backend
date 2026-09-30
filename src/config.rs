@@ -146,6 +146,8 @@ impl AppConfig {
         Ok(Self {
             database_url: env("DATABASE_URL")?,
             bind_addr: std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into()),
+            jwt_secret: secret("JWT_SECRET")?,
+            webhook_secret: secret("WEBHOOK_SECRET")?,
             jwt_secret: SecretString::new(secret_min32("JWT_SECRET")?),
             webhook_secret: SecretString::new(secret_min32("WEBHOOK_SECRET")?),
             stellar_system_wallet: Arc::new(env("STELLAR_SYSTEM_WALLET_ADDRESS")?),
@@ -158,7 +160,7 @@ impl AppConfig {
             stellar_poll_concurrency,
             wallet_encryption_key: SecretString::new(env("WALLET_ENCRYPTION_KEY")?),
             paystack_secret_key: SecretString::new(env("PAYSTACK_SECRET_KEY")?),
-            otp_hmac_secret: SecretString::new(env("OTP_HMAC_SECRET")?),
+            otp_hmac_secret: secret("OTP_HMAC_SECRET")?,
             otp_provider,
             termii_api_key,
             termii_sender_id,
@@ -177,10 +179,31 @@ impl AppConfig {
     }
 }
 
+/// Minimum number of characters required for HMAC/signing secrets.
+/// HMAC-SHA256 security degrades significantly with keys shorter than
+/// 32 bytes; this constant makes the threshold explicit and testable.
+pub const MIN_SECRET_LEN: usize = 32;
+
 fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is required"))
 }
 
+/// Read a required secret from the environment and enforce a minimum length.
+///
+/// A secret that is too short is rejected at startup with a clear error
+/// message and a `openssl rand -hex 32` generation hint so the operator
+/// knows exactly what to do.
+fn secret(name: &str) -> Result<SecretString, String> {
+    let value = env(name)?;
+    if value.len() < MIN_SECRET_LEN {
+        return Err(format!(
+            "{name} is too short ({} chars); it must be at least {MIN_SECRET_LEN} characters \
+             to provide adequate security. Generate a strong value with: \
+             openssl rand -hex 32",
+            value.len()
+        ));
+    }
+    Ok(SecretString::new(value))
 /// Reads an environment variable and rejects it if it is shorter than 32
 /// characters. HMAC-SHA256 is only as strong as its key; keys below 32 bytes
 /// fall below the NIST SP 800-107 minimum recommendation.
@@ -355,7 +378,101 @@ mod tests {
             .filter(|&v| v > 0)
             .unwrap_or(50);
         assert_eq!(concurrency, 50);
+    }
+
+    #[test]
     fn max_request_body_bytes_defaults_to_one_megabyte() {
         assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 1024 * 1024);
+    }
+
+    // --- Secret minimum-length enforcement (issue #1099) ---
+
+    /// A 32-character secret is exactly at the threshold and must be accepted.
+    #[test]
+    fn secret_fn_accepts_exactly_32_chars() {
+        let name = "TEST_SECRET_EXACTLY_32";
+        // exactly 32 ASCII characters
+        let value = "a".repeat(MIN_SECRET_LEN);
+        std::env::set_var(name, &value);
+        let result = super::secret(name);
+        std::env::remove_var(name);
+        assert!(result.is_ok(), "expected Ok for a {MIN_SECRET_LEN}-char secret");
+    }
+
+    /// A 64-character secret (typical `openssl rand -hex 32` output) must be accepted.
+    #[test]
+    fn secret_fn_accepts_64_char_hex_secret() {
+        let name = "TEST_SECRET_64";
+        let value = "a".repeat(64);
+        std::env::set_var(name, &value);
+        let result = super::secret(name);
+        std::env::remove_var(name);
+        assert!(result.is_ok(), "expected Ok for a 64-char secret");
+    }
+
+    /// A secret shorter than 32 characters must be rejected with a descriptive error.
+    #[test]
+    fn secret_fn_rejects_short_otp_hmac_secret() {
+        let name = "OTP_HMAC_SECRET_TEST_SHORT";
+        std::env::set_var(name, "tooshort");
+        let result = super::secret(name);
+        std::env::remove_var(name);
+        let err = result.expect_err("expected Err for a short secret");
+        assert!(
+            err.contains("too short"),
+            "error message should mention 'too short', got: {err}"
+        );
+        assert!(
+            err.contains("openssl rand -hex 32"),
+            "error message should include generation hint, got: {err}"
+        );
+    }
+
+    /// jwt_secret shorter than 32 chars must be rejected.
+    #[test]
+    fn secret_fn_rejects_short_jwt_secret() {
+        let name = "JWT_SECRET_TEST_SHORT";
+        std::env::set_var(name, "weak");
+        let result = super::secret(name);
+        std::env::remove_var(name);
+        assert!(result.is_err(), "expected Err for JWT_SECRET shorter than {MIN_SECRET_LEN} chars");
+    }
+
+    /// webhook_secret shorter than 32 chars must be rejected.
+    #[test]
+    fn secret_fn_rejects_short_webhook_secret() {
+        let name = "WEBHOOK_SECRET_TEST_SHORT";
+        std::env::set_var(name, "test");
+        let result = super::secret(name);
+        std::env::remove_var(name);
+        assert!(result.is_err(), "expected Err for WEBHOOK_SECRET shorter than {MIN_SECRET_LEN} chars");
+    }
+
+    /// A missing secret must still return a "required" error, not a length error.
+    #[test]
+    fn secret_fn_returns_required_error_when_missing() {
+        let name = "DEFINITELY_UNSET_SECRET_XYZ";
+        std::env::remove_var(name);
+        let result = super::secret(name);
+        let err = result.expect_err("expected Err for missing secret");
+        assert!(
+            err.contains("required"),
+            "error message should say 'required' for a missing var, got: {err}"
+        );
+    }
+
+    /// Boundary: a 31-character value is one short of the minimum and must be rejected.
+    #[test]
+    fn secret_fn_rejects_31_char_secret() {
+        let name = "TEST_SECRET_31_CHARS";
+        let value = "b".repeat(MIN_SECRET_LEN - 1);
+        std::env::set_var(name, &value);
+        let result = super::secret(name);
+        std::env::remove_var(name);
+        assert!(
+            result.is_err(),
+            "expected Err for a {}-char secret (one below minimum)",
+            MIN_SECRET_LEN - 1
+        );
     }
 }
